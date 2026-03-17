@@ -84,9 +84,17 @@ fn extract(path: &PathBuf, out_dir: &PathBuf, files: &[String]) -> Result<()> {
                 .with_context(|| format!("can't create parent dirs for {:?}", parent))?;
         }
 
-        let (data, compression) = zip
-            .read(file_name)
-            .with_context(|| format!("can't read file {:?} from archive", file_name))?;
+        let (data, compression) = match zip.read(file_name) {
+            Ok(v) => v,
+            Err(e) => {
+                println!(
+                    "[-] can't extract file from archive - {:?} - {}",
+                    file_name,
+                    e.to_string().red().bold(),
+                );
+                continue;
+            }
+        };
 
         let mut f = match std::fs::File::create(&file_path) {
             Ok(v) => v,
