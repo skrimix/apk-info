@@ -18,6 +18,12 @@ use crate::models::{
 /// The name of the manifest to be searched for in the zip archive.
 const ANDROID_MANIFEST_PATH: &str = "AndroidManifest.xml";
 
+/// The name of the manifest to be searched for in the XAPK format.
+const XAPK_MANIFEST_PATH: &str = "manifest.json";
+
+/// The name of the base.apk to be searched for in the APKM format.
+const APKM_BASE_APK: &str = "base.apk";
+
 /// The name of the resource to be searched in the zip archive.
 const RESOURCE_TABLE_PATH: &str = "resources.arsc";
 
@@ -31,6 +37,23 @@ pub struct Apk {
 
 /// Implementation of internal methods
 impl Apk {
+    fn get_arsc(zip: &ZipEntry) -> Result<Option<ARSC>, APKError> {
+        match zip.read(RESOURCE_TABLE_PATH) {
+            Ok((data, _)) => Ok(Some(
+                ARSC::new(&mut &data[..]).map_err(APKError::ResourceError)?,
+            )),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn get_axml(manifest: &[u8], arsc: Option<&ARSC>) -> Result<AXML, APKError> {
+        if manifest.is_empty() {
+            return Err(APKError::InvalidInput("AndroidManifest.xml is empty"));
+        }
+
+        AXML::new(&mut &manifest[..], arsc).map_err(APKError::ManifestError)
+    }
+
     /// Helper function for reading apk files
     fn init(p: &Path) -> Result<(ZipEntry, AXML, Option<ARSC>), APKError> {
         let file = File::open(p).map_err(APKError::IoError)?;
@@ -44,66 +67,46 @@ impl Apk {
 
         let zip = ZipEntry::new(input).map_err(APKError::ZipError)?;
 
-        match zip.read(ANDROID_MANIFEST_PATH) {
-            Ok((manifest, _)) => {
-                if manifest.is_empty() {
-                    return Err(APKError::InvalidInput(
-                        "AndroidManifest.xml is empty, not a valid apk",
-                    ));
-                }
+        // attempt to get normal apk
+        if let Ok((manifest, _)) = zip.read(ANDROID_MANIFEST_PATH) {
+            let arsc = Self::get_arsc(&zip)?;
+            let axml = Self::get_axml(&manifest, arsc.as_ref())?;
 
-                let arsc = match zip.read(RESOURCE_TABLE_PATH) {
-                    Ok((resource_data, _)) => {
-                        Some(ARSC::new(&mut &resource_data[..]).map_err(APKError::ResourceError)?)
-                    }
-                    Err(_) => None,
-                };
-
-                let axml = AXML::new(&mut &manifest[..], arsc.as_ref())
-                    .map_err(APKError::ManifestError)?;
-
-                Ok((zip, axml, arsc))
-            }
-            Err(_) => {
-                // maybe this is xapk?
-                let (manifest_json_data, _) = zip.read("manifest.json").map_err(|_| {
-                    APKError::InvalidInput(
-                        "can't find AndroidManifest.xml or manifest.json, is it apk/xapk?",
-                    )
-                })?;
-
-                let manifest_json: XAPKManifest = serde_json::from_slice(&manifest_json_data)
-                    .map_err(APKError::XAPKManifestError)?;
-
-                let package_name = format!("{}.apk", manifest_json.package_name);
-                let (inner_apk_data, _) = zip.read(&package_name).map_err(APKError::ZipError)?;
-
-                let inner_apk = ZipEntry::new(inner_apk_data).map_err(APKError::ZipError)?;
-
-                // try again read AndroidManifest.xml from inner apk
-                let (inner_manifest, _) = inner_apk
-                    .read(ANDROID_MANIFEST_PATH)
-                    .map_err(APKError::ZipError)?;
-
-                if inner_manifest.is_empty() {
-                    return Err(APKError::InvalidInput(
-                        "AndroidManifest.xml in inner apk is empty, not a valid xapk",
-                    ));
-                }
-
-                let arsc = match zip.read(RESOURCE_TABLE_PATH) {
-                    Ok((resource_data, _)) => {
-                        Some(ARSC::new(&mut &resource_data[..]).map_err(APKError::ResourceError)?)
-                    }
-                    Err(_) => None,
-                };
-
-                let axml = AXML::new(&mut &inner_manifest[..], arsc.as_ref())
-                    .map_err(APKError::ManifestError)?;
-
-                Ok((zip, axml, arsc))
-            }
+            return Ok((zip, axml, arsc));
         }
+
+        // attempt to get xapk
+        if let Ok((manifest_json_data, _)) = zip.read(XAPK_MANIFEST_PATH) {
+            let manifest_json: XAPKManifest =
+                serde_json::from_slice(&manifest_json_data).map_err(APKError::XAPKManifestError)?;
+
+            let package_name = format!("{}.apk", manifest_json.package_name);
+            let (inner_apk_data, _) = zip.read(&package_name).map_err(APKError::ZipError)?;
+            let inner_apk = ZipEntry::new(inner_apk_data).map_err(APKError::ZipError)?;
+            let (inner_manifest, _) = inner_apk
+                .read(ANDROID_MANIFEST_PATH)
+                .map_err(APKError::ZipError)?;
+
+            let arsc = Self::get_arsc(&inner_apk)?;
+            let axml = Self::get_axml(&inner_manifest, arsc.as_ref())?;
+
+            return Ok((zip, axml, arsc));
+        }
+
+        // attempt to get apkm
+        if let Ok((inner_apk_data, _)) = zip.read(APKM_BASE_APK) {
+            let inner_apk = ZipEntry::new(inner_apk_data).map_err(APKError::ZipError)?;
+            let (inner_manifest, _) = inner_apk
+                .read(ANDROID_MANIFEST_PATH)
+                .map_err(APKError::ZipError)?;
+
+            let arsc = Self::get_arsc(&inner_apk)?;
+            let axml = Self::get_axml(&inner_manifest, arsc.as_ref())?;
+
+            return Ok((zip, axml, arsc));
+        }
+
+        Err(APKError::InvalidInput("is it apk/xapk/apkm?"))
     }
 }
 
